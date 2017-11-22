@@ -1,0 +1,96 @@
+## Redis Cluster data sharding
+Redis Cluster does not use consistent hashing, but a different form of sharding where every key is conceptually part of what we call an **hash slot**.
+
+There are 16384 hash slots in Redis Cluster, and to compute what is the hash slot of a given key, we simply take the CRC16 of the key modulo 16384.
+
+Every node in a Redis Cluster is responsible for a subset of the hash slots, so for example you may have a cluster with 3 nodes, where:
+
+- Node A contains hash slots from 0 to 5500.
+- Node B contains hash slots from 5501 to 11000.
+- Node C contains hash slots from 11001 to 16383.
+
+![Hash collision resolved by separate chaining.](https://upload.wikimedia.org/wikipedia/commons/d/d0/Hash_table_5_0_1_1_1_1_1_LL.svg)
+
+## Redis Cluster master-slave model
+In order to remain available when a subset of master nodes are failing or are not able to communicate with the majority of nodes, Redis Cluster uses a master-slave model where every hash slot has from 1 (the master itself) to N replicas (N-1 additional slaves nodes).
+
+In our example cluster with nodes A, B, C, if node B fails the cluster is not able to continue, since we no longer have a way to serve hash slots in the range 5501-11000.
+
+However when the cluster is created (or at a later time) we add a slave node to every master, so that the final cluster is composed of A, B, C that are masters nodes, and A1, B1, C1 that are slaves nodes, the system is able to continue if node B fails.
+
+Node B1 replicates B, and B fails, the cluster will promote node B1 as the new master and will continue to operate correctly.
+
+However note that if nodes B and B1 fail at the same time Redis Cluster is not able to continue to operate.
+
+## Redis Cluster consistency guarantees
+Redis Cluster is not able to guarantee **strong consistency**. In practical terms this means that under certain conditions it is possible that Redis Cluster will lose writes that were acknowledged by the system to the client.
+
+The first reason why Redis Cluster can lose writes is because it uses asynchronous replication. This means that during writes the following happens:
+
+- Your client writes to the master B.
+- The master B replies OK to your client.
+- The master B propagates the write to its slaves B1, B2 and B3.
+
+As you can see B does not wait for an acknowledge from B1, B2, B3 before replying to the client, since this would be a prohibitive latency penalty for Redis, so if your client writes something, B acknowledges the write, but crashes before being able to send the write to its slaves, one of the slaves (that did not receive the write) can be promoted to master, losing the write forever.
+
+# Creating and using a Redis Cluster
+To create a cluster, the first thing we need is to have a few empty Redis instances running in cluster mode. This basically means that clusters are not created using normal Redis instances as a special mode needs to be configured so that the Redis instance will enable the Cluster specific features and commands.
+
+The following is a minimal Redis cluster configuration file:
+
+```
+port 7000
+cluster-enabled yes
+cluster-config-file nodes.conf
+cluster-node-timeout 5000
+appendonly yes
+```
+As you can see what enables the cluster mode is simply the `cluster-enabled` directive. Every instance also contains the path of a file where the configuration for this node is stored, which by default is `nodes.conf`. This file is never touched by humans; it is simply generated at startup by the Redis Cluster instances, and updated every time it is needed.
+
+Note that the **minimal cluster** that works as expected requires to contain at least three master nodes. For your first tests it is strongly suggested to start a six nodes cluster with three masters and three slaves.
+
+To do so, enter a new directory, and create the following directories named after the port number of the instance we'll run inside any given directory.
+
+Something like:
+```
+mkdir cluster-test
+cd cluster-test
+mkdir 7000 7001 7002 7003 7004 7005
+```
+Create a `redis.conf` file inside each of the directories, from 7000 to 7005. As a template for your configuration file just use the small example above, but make sure to replace the port number `7000` with the right port number according to the directory name.
+
+Now copy your redis-server executable, **compiled from the latest sources in the unstable branch at GitHub**, into the `cluster-test` directory, and finally open 6 terminal tabs in your favorite terminal application.
+
+Start every instance like that, one every tab:
+```
+cd 7000
+../redis-server ./redis.conf
+```
+
+As you can see from the logs of every instance, since no `nodes.conf` file existed, every node assigns itself a new ID.
+```
+[82462] 26 Nov 11:56:55.329 * No cluster configuration found, I'm 97a3a64667477371c4479320d683e4c8db5858b1
+```
+This ID will be used forever by this specific instance in order for the instance to have a unique name in the context of the cluster.
+
+## Creating the cluster
+Now that we have a number of instances running, we need to create our cluster by writing some meaningful configuration to the nodes.
+
+This is very easy to accomplish as we are helped by the Redis Cluster command line utility called `redis-trib`, a Ruby program executing special commands on instances in order to create new clusters, check or reshard an existing cluster, and so forth.
+
+The `redis-trib` utility is in the src directory of the Redis source code distribution. You need to install `redis` gem to be able to run `redis-trib`.
+
+```
+gem install redis
+```
+To create your cluster simply type:
+
+```
+./redis-trib.rb create --replicas 1 127.0.0.1:7000 127.0.0.1:7001 \
+127.0.0.1:7002 127.0.0.1:7003 127.0.0.1:7004 127.0.0.1:7005
+```
+The command used here is **create**, since we want to create a new cluster. The option `--replicas 1` means that we want a slave for every master created. The other arguments are the list of addresses of the instances I want to use to create the new cluster.
+
+Obviously the only setup with our requirements is to create a cluster with 3 masters and 3 slaves.
+
+Redis-trib will propose you a configuration. Accept the proposed configuration by typing **yes**. The cluster will be configured and joined, which means, instances will be bootstrapped into talking with each other.
