@@ -94,3 +94,62 @@ The command used here is **create**, since we want to create a new cluster. The 
 Obviously the only setup with our requirements is to create a cluster with 3 masters and 3 slaves.
 
 Redis-trib will propose you a configuration. Accept the proposed configuration by typing **yes**. The cluster will be configured and joined, which means, instances will be bootstrapped into talking with each other.
+
+## Writing an example app with redis-rb-cluster
+This section explains some basic usage of redis-rb-cluster showing two examples. The first is the following, and is the example.rb file inside the redis-rb-cluster distribution:
+
+```
+   1  require './cluster'
+   2
+   3  if ARGV.length != 2
+   4      startup_nodes = [
+   5          {:host => "127.0.0.1", :port => 7000},
+   6          {:host => "127.0.0.1", :port => 7001}
+   7      ]
+   8  else
+   9      startup_nodes = [
+  10          {:host => ARGV[0], :port => ARGV[1].to_i}
+  11      ]
+  12  end
+  13
+  14  rc = RedisCluster.new(startup_nodes,32,:timeout => 0.1)
+  15
+  16  last = false
+  17
+  18  while not last
+  19      begin
+  20          last = rc.get("__last__")
+  21          last = 0 if !last
+  22      rescue => e
+  23          puts "error #{e.to_s}"
+  24          sleep 1
+  25      end
+  26  end
+  27
+  28  ((last.to_i+1)..1000000000).each{|x|
+  29      begin
+  30          rc.set("foo#{x}",x)
+  31          puts rc.get("foo#{x}")
+  32          rc.set("__last__",x)
+  33      rescue => e
+  34          puts "error #{e.to_s}"
+  35      end
+  36      sleep 0.1
+  37  }
+```
+The application does a very simple thing, it sets keys in the form `foo<number>` to `number`, one after the other. So if you run the program the result is the following stream of commands:
+
+- SET foo0 0
+- SET foo1 1
+- SET foo2 2
+- And so forth...
+
+The program looks more complex than it should usually as it is designed to show errors on the screen instead of exiting with an exception, so every operation performed with the cluster is wrapped by `begin` `rescue` blocks.
+
+The **line 14** is the first interesting line in the program. It creates the Redis Cluster object, using as argument a list of *startup nodes*, the maximum number of connections this object is allowed to take against different nodes, and finally the timeout after a given operation is considered to be failed.
+
+The startup nodes don't need to be all the nodes of the cluster. The important thing is that at least one node is reachable. Also note that redis-rb-cluster updates this list of startup nodes as soon as it is able to connect with the first node. You should expect such a behavior with any other serious client.
+
+Now that we have the Redis Cluster object instance stored in the **rc** variable we are ready to use the object like if it was a normal Redis object instance.
+
+Note the `sleep` call at the end of the loop. In your tests you can remove the sleep if you want to write to the cluster as fast as possible (relatively to the fact that this is a busy loop without real parallelism of course, so you'll get the usually 10k ops/second in the best of the conditions).
